@@ -1,10 +1,8 @@
 import logging
 import os
-from typing import Dict
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 import pandas as pd
-from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +82,7 @@ def merge_and_push(**context) -> None:
             if dropped > 0:
                 logger.warning(f"Dropped {dropped} rows from sales_fact due to missing customer_id or customer_sk.")
 
-            # Upsert fact table
+            # insert fact table
             insert_fact(
                 conn,
                 table_name="sales_fact",
@@ -164,29 +162,6 @@ def ensure_tables(conn) -> None:
         """
     ))
 
-
-def upsert_fact(conn, table_name: str, rows: list) -> None:
-    """Upsert rows into the fact table."""
-    if not rows:
-        return
-    logger.info(f"Upserting {len(rows)} rows into {table_name}...")
-    columns = rows[0].keys()
-    col_list = ', '.join(columns)
-    val_placeholders = ', '.join([f':{col}' for col in columns])
-    # For fact table, upsert on fact_id
-    update_columns = [col for col in columns if col != 'fact_id']
-    update_clause = ', '.join([f'{col}=EXCLUDED.{col}' for col in update_columns])
-
-    sql = f""" 
-        INSERT INTO {table_name} ({col_list}) 
-        VALUES ({val_placeholders}) 
-        ON CONFLICT (fact_id) DO UPDATE SET {update_clause} 
-    """
-
-    for row in rows:
-        conn.execute(text(sql), row)
-
-
 def fetch_uuid_map(conn, table: str, key_cols: list, uuid_col: str) -> dict:
     """Fetch UUID mappings from a dimension table."""
     cols = ", ".join(key_cols + [uuid_col])
@@ -223,21 +198,31 @@ def insert_fact(conn, table_name: str, rows: list) -> None:
         conn.execute(text(sql), row)
 
 
-def upsert_dimension(conn, table_name: str, rows: list, pk_column: str, delta_key_columns: list,
+def upsert_dimension(conn, table_name: str, rows: list,
+                     pk_column: str, delta_key_columns: list,
                      update_columns: list) -> None:
     if not rows:
         return
+
     logger.info(f"Upserting {len(rows)} rows into {table_name}...")
-    # Build columns and values
+
     columns = rows[0].keys()
     col_list = ', '.join(columns)
     val_placeholders = ', '.join([f':{col}' for col in columns])
-    # Build ON CONFLICT clause
     update_clause = ', '.join([f'{col}=EXCLUDED.{col}' for col in update_columns])
-    sql = f""" 
-        INSERT INTO {table_name} ({col_list}) 
-        VALUES ({val_placeholders}) 
-        ON CONFLICT ({pk_column}) DO UPDATE SET {update_clause} """
+    conflict_target = ', '.join(delta_key_columns) if delta_key_columns else pk_column
 
-    for row in rows:
-        conn.execute(text(sql), row)
+    sql = f"""
+        INSERT INTO {table_name} ({col_list})
+        VALUES ({val_placeholders})
+        ON CONFLICT ({conflict_target})
+        DO UPDATE SET {update_clause}
+    """
+
+    try:
+        conn.execute(text(sql), rows)
+        logger.info(f"Upsert successful for {table_name}")
+    except Exception as e:
+        logger.error(f"Error during upsert for {table_name}: {e}")
+        raise
+
